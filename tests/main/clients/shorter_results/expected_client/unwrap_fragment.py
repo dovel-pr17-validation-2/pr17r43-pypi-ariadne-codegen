@@ -1,0 +1,3 @@
+from .shorter_results_fragments import FragmentWithSingleField
+
+UnwrapFragment = FragmentWithSingleField

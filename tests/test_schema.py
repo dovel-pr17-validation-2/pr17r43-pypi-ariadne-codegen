@@ -1,0 +1,916 @@
+from pathlib import Path
+
+import httpx
+import pytest
+from graphql import GraphQLSchema, OperationDefinitionNode, build_schema
+
+from ariadne_codegen.exceptions import (
+    IntrospectionError,
+    InvalidConfiguration,
+    InvalidGraphqlSyntax,
+    InvalidOperationForSchema,
+)
+from ariadne_codegen.schema import (
+    get_graphql_queries,
+    get_graphql_schema_from_path,
+    get_graphql_schema_from_paths,
+    introspect_remote_schema,
+    load_graphql_files_from_path,
+    read_graphql_file,
+    resolve_schema_paths,
+    walk_graphql_files,
+)
+from ariadne_codegen.settings import IntrospectionSettings, get_validation_rule
+
+
+@pytest.fixture
+def schema_str():
+    return """
+        type Query {
+            test: Custom
+        }
+
+        type Custom {
+            node: String
+            default: String
+        }
+    """
+
+
+@pytest.fixture
+def extra_type_str():
+    return """
+        type User {
+            name: String
+        }
+    """
+
+
+@pytest.fixture
+def test_query_str():
+    return """
+        query testQuery {
+            test {
+                node
+                default
+            }
+        }
+    """
+
+
+@pytest.fixture
+def test_query_2_str():
+    return """
+        query testQuery2 {
+            test {
+                node
+                default
+            }
+        }
+    """
+
+
+@pytest.fixture
+def test_fragment_str():
+    return """
+        fragment fragmentA on Custom {
+            node
+        }
+        query testQuery2 {
+            test {
+                default
+                ...fragmentA
+            }
+        }
+    """
+
+
+@pytest.fixture
+def test_duplicate_fragment_str():
+    return """
+        fragment fragmentA on Custom {
+            node
+        }
+        fragment fragmentA on Custom {
+            node
+        }
+        query testQuery2 {
+            test {
+                default
+                ...fragmentA
+            }
+        }
+    """
+
+
+@pytest.fixture
+def test_unused_fragment_str():
+    return """
+        fragment fragmentA on Custom {
+            node
+        }
+        query testQuery2 {
+            test {
+                default
+            }
+        }
+    """
+
+
+@pytest.fixture
+def single_file_schema(tmp_path_factory, schema_str):
+    file_ = tmp_path_factory.mktemp("schema").joinpath("schema.graphql")
+    file_.write_text(schema_str, encoding="utf-8")
+    return file_
+
+
+@pytest.fixture
+def invalid_schema_file(tmp_path_factory):
+    file_ = tmp_path_factory.mktemp("schema").joinpath("schema.graphql")
+    schema_str = """
+        type Query {
+            test: String! @unknownDirective
+        }
+    """
+    file_.write_text(schema_str, encoding="utf-8")
+    return file_
+
+
+@pytest.fixture
+def invalid_syntax_schema_file(tmp_path_factory):
+    file_ = tmp_path_factory.mktemp("schema").joinpath("schema.graphql")
+    schema_str = """
+        type Query {
+            test: Custom
+
+        type Custom {
+            node: String
+            default: String
+        }
+    """
+    file_.write_text(schema_str, encoding="utf-8")
+    return file_
+
+
+@pytest.fixture
+def schemas_directory(tmp_path_factory, schema_str, extra_type_str):
+    schemas_dir = tmp_path_factory.mktemp("schemas")
+    first_file = schemas_dir.joinpath("schema.graphql")
+    first_file.write_text(schema_str, encoding="utf-8")
+    second_file = schemas_dir.joinpath("user.graphql")
+    second_file.write_text(extra_type_str, encoding="utf-8")
+    return schemas_dir
+
+
+@pytest.fixture
+def schemas_nested_directories(tmp_path_factory, schema_str, extra_type_str):
+    schemas_dir = tmp_path_factory.mktemp("schemas")
+    nested_dir = schemas_dir.joinpath("nested")
+    nested_dir.mkdir()
+    first_file = schemas_dir.joinpath("schema.graphql")
+    first_file.write_text(schema_str, encoding="utf-8")
+    second_file = nested_dir.joinpath("user.graphql")
+    second_file.write_text(extra_type_str, encoding="utf-8")
+    return schemas_dir
+
+
+@pytest.fixture
+def path_fixture(request):
+    return request.getfixturevalue(request.param)
+
+
+@pytest.fixture
+def single_file_query(tmp_path_factory, test_query_str):
+    file_ = tmp_path_factory.mktemp("queries").joinpath("query1.graphql")
+    file_.write_text(test_query_str, encoding="utf-8")
+    return file_
+
+
+@pytest.fixture
+def single_file_query_with_fragment(
+    tmp_path_factory, test_query_str, test_fragment_str
+):
+    file_ = tmp_path_factory.mktemp("queries").joinpath("query1_fragment.graphql")
+    file_.write_text(test_query_str + test_fragment_str, encoding="utf-8")
+    return file_
+
+
+@pytest.fixture
+def single_file_query_with_duplicate_fragment(
+    tmp_path_factory, test_query_str, test_duplicate_fragment_str
+):
+    file_ = tmp_path_factory.mktemp("queries").joinpath(
+        "query1_duplicate_fragment.graphql"
+    )
+    file_.write_text(test_query_str + test_duplicate_fragment_str, encoding="utf-8")
+    return file_
+
+
+@pytest.fixture
+def single_file_query_with_unused_fragment(
+    tmp_path_factory, test_query_str, test_unused_fragment_str
+):
+    file_ = tmp_path_factory.mktemp("queries").joinpath(
+        "query1_unused_fragment.graphql"
+    )
+    file_.write_text(test_query_str + test_unused_fragment_str, encoding="utf-8")
+    return file_
+
+
+@pytest.fixture
+def invalid_syntax_query_file(tmp_path_factory):
+    file_ = tmp_path_factory.mktemp("queries").joinpath("query.graphql")
+    query_str = """
+        query testQuery
+            test {
+                node
+                default
+            }
+        }
+    """
+    file_.write_text(query_str, encoding="utf-8")
+    return file_
+
+
+@pytest.fixture
+def invalid_query_for_schema_file(tmp_path_factory):
+    file_ = tmp_path_factory.mktemp("queries").joinpath("query.graphql")
+    query_str = """
+        query testQuery {
+            test {
+                node
+                default
+            }
+            anotherQuery
+        }
+    """
+    file_.write_text(query_str, encoding="utf-8")
+    return file_
+
+
+@pytest.fixture
+def queries_directory(tmp_path_factory, test_query_str, test_query_2_str):
+    schemas_dir = tmp_path_factory.mktemp("queries")
+    first_file = schemas_dir.joinpath("query1.graphql")
+    first_file.write_text(test_query_str, encoding="utf-8")
+    second_file = schemas_dir.joinpath("query2.graphql")
+    second_file.write_text(test_query_2_str, encoding="utf-8")
+    return schemas_dir
+
+
+def test_read_graphql_file_returns_content_of_file(single_file_schema, schema_str):
+    assert read_graphql_file(single_file_schema) == schema_str
+
+
+def test_read_graphql_file_with_invalid_file_raises_invalid_graphql_syntax_exception(
+    invalid_syntax_schema_file,
+):
+    with pytest.raises(InvalidGraphqlSyntax) as exc:
+        read_graphql_file(invalid_syntax_schema_file)
+    # Normalize path separators so the assertion passes on Windows (path in
+    # message may use backslashes; we only care that the faulty file is named).
+    path_in_message = Path(invalid_syntax_schema_file).resolve().as_posix()
+    message_normalized = str(exc.value).replace("\\", "/")
+    assert path_in_message in message_normalized
+
+
+def test_walk_graphql_files_returns_graphql_files_from_directory(schemas_directory):
+    assert sorted(f.name for f in walk_graphql_files(schemas_directory)) == sorted(
+        ["schema.graphql", "user.graphql"]
+    )
+
+
+def test_walk_graphql_files_returns_graphql_files_from_nested_directory(
+    schemas_nested_directories,
+):
+    assert sorted(
+        f.name for f in walk_graphql_files(schemas_nested_directories)
+    ) == sorted(["schema.graphql", "user.graphql"])
+
+
+def test_load_graphql_files_from_path_returns_schema_from_single_file(
+    single_file_schema, schema_str
+):
+    assert load_graphql_files_from_path(single_file_schema) == schema_str
+
+
+def test_load_graphql_files_from_path_returns_schema_from_directory(
+    schemas_directory, schema_str, extra_type_str
+):
+    content = load_graphql_files_from_path(schemas_directory)
+
+    assert schema_str in content
+    assert extra_type_str in content
+
+
+def test_load_graphql_files_from_path_returns_schema_from_nested_directory(
+    schemas_nested_directories, schema_str, extra_type_str
+):
+    content = load_graphql_files_from_path(schemas_nested_directories)
+
+    assert schema_str in content
+    assert extra_type_str in content
+
+
+@pytest.mark.parametrize(
+    "path_fixture",
+    [
+        "single_file_schema",
+        "invalid_schema_file",
+        "schemas_directory",
+        "schemas_nested_directories",
+    ],
+    indirect=True,
+)
+def test_get_graphql_schema_from_path_returns_graphql_schema(path_fixture):
+    assert isinstance(
+        get_graphql_schema_from_path(path_fixture.as_posix()), GraphQLSchema
+    )
+
+
+def test_get_graphql_schema_from_path_with_invalid_syntax_raises_invalid_graphql_syntax(
+    invalid_syntax_schema_file,
+):
+    with pytest.raises(InvalidGraphqlSyntax):
+        get_graphql_schema_from_path(invalid_syntax_schema_file.as_posix())
+
+
+def test_introspect_remote_schema_called_with_invalid_url_raises_introspection_error(
+    mocker,
+):
+    mocker.patch(
+        "ariadne_codegen.schema.httpx.URL", side_effect=httpx.InvalidURL("msg")
+    )
+
+    with pytest.raises(IntrospectionError):
+        introspect_remote_schema("invalid_url", httpx)
+
+
+def test_introspect_remote_schema_raises_introspection_error_for_not_success_response(
+    mocker,
+):
+    mocker.patch(
+        "ariadne_codegen.schema.httpx.post",
+        return_value=httpx.Response(status_code=400),
+    )
+
+    with pytest.raises(IntrospectionError) as exc:
+        introspect_remote_schema("http://testserver/graphql/", httpx)
+
+    assert "400" in exc.value.args[0]
+
+
+def test_introspect_remote_schema_raises_introspection_error_for_not_json_response(
+    mocker,
+):
+    mocker.patch(
+        "ariadne_codegen.schema.httpx.post",
+        return_value=httpx.Response(status_code=200, content="invalid_json"),
+    )
+
+    with pytest.raises(IntrospectionError):
+        introspect_remote_schema("http://testserver/graphql/", httpx)
+
+
+def test_introspect_remote_schema_raises_introspection_error_for_not_dict_response(
+    mocker,
+):
+    mocker.patch(
+        "ariadne_codegen.schema.httpx.post",
+        return_value=httpx.Response(status_code=200, content="[]"),
+    )
+
+    with pytest.raises(IntrospectionError) as exc:
+        introspect_remote_schema("http://testserver/graphql/", httpx)
+
+    assert "Invalid introspection result format." in str(exc.value)
+
+
+def test_introspect_remote_schema_raises_introspection_error_for_json_without_data_key(
+    mocker,
+):
+    mocker.patch(
+        "ariadne_codegen.schema.httpx.post",
+        return_value=httpx.Response(status_code=200, content='{"not_data": null}'),
+    )
+
+    with pytest.raises(IntrospectionError) as exc:
+        introspect_remote_schema("http://testserver/graphql/", httpx)
+
+    assert "Invalid data key in introspection result." in str(exc.value)
+
+
+def test_introspect_remote_schema_raises_introspection_error_for_graphql_errors(mocker):
+    mocker.patch(
+        "ariadne_codegen.schema.httpx.post",
+        return_value=httpx.Response(
+            status_code=200,
+            content="""
+            {
+                "data": {},
+                "errors": {
+                    "message": "Error message",
+                    "locations": [{"line": 6, "column": 7}],
+                    "path": ["field1", "field2", 1, "id"]
+                }
+            }
+            """,
+        ),
+    )
+
+    with pytest.raises(IntrospectionError) as exc:
+        introspect_remote_schema("http://testserver/graphql/", httpx)
+
+    assert "Error message" in exc.value.args[0]
+
+
+def test_introspect_remote_schema_raises_introspection_error_for_invalid_data_value(
+    mocker,
+):
+    mocker.patch(
+        "ariadne_codegen.schema.httpx.post",
+        return_value=httpx.Response(
+            status_code=200,
+            content='{"data": []}',
+        ),
+    )
+
+    with pytest.raises(IntrospectionError) as exc:
+        introspect_remote_schema("http://testserver/graphql/", httpx)
+
+    assert "Invalid data key in introspection result." in str(exc.value)
+
+
+def test_introspect_remote_schema_returns_introspection_result(mocker):
+    mocker.patch(
+        "ariadne_codegen.schema.httpx.post",
+        return_value=httpx.Response(
+            status_code=200,
+            content='{"data": {"__schema": {}}}',
+        ),
+    )
+
+    result = introspect_remote_schema("http://testserver/graphql/", httpx)
+
+    assert result == {"__schema": {}}
+
+
+def test_introspect_remote_schema_uses_provided_headers(mocker):
+    mocked_post = mocker.patch(
+        "ariadne_codegen.schema.httpx.post",
+        return_value=httpx.Response(
+            status_code=200,
+            content='{"data": {"__schema": {}}}',
+        ),
+    )
+
+    introspect_remote_schema(
+        "http://testserver/graphql/", httpx, headers={"test": "value"}
+    )
+
+    assert mocked_post.called
+    assert mocked_post.call_args.kwargs["headers"] == {"test": "value"}
+
+
+@pytest.mark.parametrize("verify_ssl", [True, False])
+def test_introspect_remote_schema_uses_provided_verify_ssl_flag(verify_ssl, mocker):
+    mocked_post = mocker.patch(
+        "ariadne_codegen.schema.httpx.post",
+        return_value=httpx.Response(
+            status_code=200, content='{"data": {"__schema": {}}}'
+        ),
+    )
+
+    introspect_remote_schema("http://testserver/graphql/", httpx, verify_ssl=verify_ssl)
+
+    assert mocked_post.called
+    assert mocked_post.call_args.kwargs["verify"] == verify_ssl
+
+
+def test_introspect_remote_schema_works_with_custom_classes():
+
+    class TestResponse:
+        status_code = 200
+
+        def json(self, **kwargs):
+            return {"data": {"__schema": {}}}
+
+    class TestClient:
+        def post(self, url, **kwargs):
+            return TestResponse()
+
+    result = introspect_remote_schema("http://testserver/graphql/", TestClient())
+
+    assert result == {"__schema": {}}
+
+
+def test_get_graphql_queries_returns_schema_definitions_from_single_file(
+    single_file_query, schema_str
+):
+    queries = get_graphql_queries(
+        single_file_query.as_posix(), build_schema(schema_str)
+    )
+    assert len(queries) == 1
+    assert isinstance(queries[0], OperationDefinitionNode)
+    assert queries[0].name
+    assert queries[0].name.value == "testQuery"
+
+
+def test_get_graphql_queries_returns_schema_definitions_from_directory(
+    queries_directory, schema_str
+):
+    queries = get_graphql_queries(
+        queries_directory.as_posix(), build_schema(schema_str)
+    )
+    assert len(queries) == 2
+    assert isinstance(queries[0], OperationDefinitionNode)
+    assert isinstance(queries[1], OperationDefinitionNode)
+    assert queries[0].name
+    assert queries[1].name
+    assert queries[0].name.value == "testQuery"
+    assert queries[1].name.value == "testQuery2"
+
+
+def test_get_graphql_queries_with_invalid_file_raises_invalid_graphql_syntax_exception(
+    invalid_syntax_query_file, schema_str
+):
+    with pytest.raises(InvalidGraphqlSyntax):
+        get_graphql_queries(
+            invalid_syntax_query_file.as_posix(), build_schema(schema_str)
+        )
+
+
+def test_get_graphql_queries_with_invalid_query_for_schema_raises_invalid_operation(
+    invalid_query_for_schema_file, schema_str
+):
+    with pytest.raises(InvalidOperationForSchema):
+        get_graphql_queries(
+            invalid_query_for_schema_file.as_posix(), build_schema(schema_str)
+        )
+
+
+def test_get_graphql_queries_with_fragment_returns_schema_definitions(
+    single_file_query_with_fragment, schema_str
+):
+    queries = get_graphql_queries(
+        single_file_query_with_fragment.as_posix(), build_schema(schema_str)
+    )
+
+    assert len(queries) == 3
+
+
+def test_get_graphql_queries_with_duplicate_fragment_raises_invalid_operation(
+    single_file_query_with_duplicate_fragment, schema_str
+):
+    with pytest.raises(InvalidOperationForSchema):
+        get_graphql_queries(
+            single_file_query_with_duplicate_fragment.as_posix(),
+            build_schema(schema_str),
+        )
+
+
+def test_unused_fragment_without_skips_raises_invalid_operation(
+    single_file_query_with_unused_fragment,
+    schema_str,
+):
+    with pytest.raises(InvalidOperationForSchema):
+        get_graphql_queries(
+            single_file_query_with_unused_fragment.as_posix(),
+            build_schema(schema_str),
+            [],
+        )
+
+
+def test_duplicate_fragment_passes_when_skip_rule_enabled(
+    single_file_query_with_duplicate_fragment,
+    schema_str,
+):
+    get_graphql_queries(
+        single_file_query_with_duplicate_fragment.as_posix(),
+        build_schema(schema_str),
+        [
+            get_validation_rule("NoUnusedFragments"),
+            get_validation_rule("UniqueFragmentNames"),
+        ],
+    )
+
+
+def test_get_validation_rule_accepts_all_specified_rule_names():
+    rule = get_validation_rule("NoUnusedVariables")
+    assert rule.__name__ == "NoUnusedVariablesRule"
+
+
+def test_get_validation_rule_with_unknown_rule_raises_value_error():
+    with pytest.raises(ValueError):
+        get_validation_rule("UnknownRule")
+
+
+def test_introspect_remote_schema_passes_introspection_settings_to_introspection_query(
+    mocker,
+):
+    """
+    Test that the introspection settings are passed to the get_introspection_query
+    function when introspecting the remote schema.
+    """
+    mocked_get_query = mocker.patch(
+        "ariadne_codegen.schema.get_introspection_query",
+        return_value="query { __schema { queryType { name } } }",
+    )
+    mocker.patch(
+        "ariadne_codegen.schema.httpx.post",
+        return_value=httpx.Response(
+            status_code=200, content='{"data": {"__schema": {}}}'
+        ),
+    )
+
+    settings = IntrospectionSettings(
+        descriptions=True,
+        input_value_deprecation=True,
+        specified_by_url=True,
+        schema_description=True,
+        directive_is_repeatable=True,
+        input_object_one_of=True,
+    )
+
+    introspect_remote_schema(
+        "http://testserver/graphql/", httpx, introspection_settings=settings
+    )
+
+    mocked_get_query.assert_called_once_with(
+        descriptions=True,
+        specified_by_url=True,
+        directive_is_repeatable=True,
+        schema_description=True,
+        input_value_deprecation=True,
+        input_object_one_of=True,
+    )
+
+
+def test_introspect_remote_schema_uses_default_introspection_settings_when_not_provided(
+    mocker,
+):
+    """
+    Test that when introspection settings are not provided, the default values are used
+    in the get_introspection_query call.
+    """
+    mocked_get_query = mocker.patch(
+        "ariadne_codegen.schema.get_introspection_query",
+        return_value="query { __schema { queryType { name } } }",
+    )
+    mocker.patch(
+        "ariadne_codegen.schema.httpx.post",
+        return_value=httpx.Response(
+            status_code=200, content='{"data": {"__schema": {}}}'
+        ),
+    )
+
+    introspect_remote_schema("http://testserver/graphql/", httpx)
+
+    mocked_get_query.assert_called_once_with(
+        descriptions=False,
+        specified_by_url=False,
+        directive_is_repeatable=False,
+        schema_description=False,
+        input_value_deprecation=False,
+        input_object_one_of=False,
+    )
+
+
+def test_resolve_schema_paths_with_local_files_and_directories(
+    tmp_path, schema_str, schemas_directory
+):
+    single_file = tmp_path / "extra.graphql"
+    single_file.write_text(schema_str, encoding="utf-8")
+
+    result = resolve_schema_paths(
+        [single_file.as_posix(), schemas_directory.as_posix()]
+    )
+
+    assert single_file in result
+    assert {"schema.graphql", "user.graphql"}.issubset({p.name for p in result})
+
+
+def test_resolve_schema_paths_with_callable_python_attribute(
+    tmp_path, schema_str, mocker
+):
+    schema_file = tmp_path / "schema.graphql"
+    schema_file.write_text(schema_str, encoding="utf-8")
+
+    mock_callable = mocker.Mock(return_value=[schema_file.as_posix()])
+    mock_module = mocker.Mock()
+    mock_module.get_files = mock_callable
+    mocker.patch(
+        "ariadne_codegen.module_importer.importlib.import_module",
+        return_value=mock_module,
+    )
+
+    result = resolve_schema_paths(["some_pkg.get_files"])
+
+    assert result == [Path(schema_file.as_posix())]
+    mock_callable.assert_called_once()
+
+
+def test_resolve_schema_paths_with_path_attribute_pointing_to_directory(
+    schemas_directory, mocker
+):
+    mock_module = mocker.Mock()
+    mock_module.SCHEMA_DIR = schemas_directory.as_posix()
+    mocker.patch(
+        "ariadne_codegen.module_importer.importlib.import_module",
+        return_value=mock_module,
+    )
+
+    result = resolve_schema_paths(["some_pkg.SCHEMA_DIR"])
+
+    names = {p.name for p in result}
+    assert "schema.graphql" in names
+    assert "user.graphql" in names
+
+
+def test_resolve_schema_paths_with_path_attribute_pointing_to_file(
+    tmp_path, schema_str, mocker
+):
+    schema_file = tmp_path / "schema.graphql"
+    schema_file.write_text(schema_str, encoding="utf-8")
+    mock_module = mocker.Mock()
+    mock_module.SCHEMA_FILE = schema_file.as_posix()
+    mocker.patch(
+        "ariadne_codegen.module_importer.importlib.import_module",
+        return_value=mock_module,
+    )
+
+    result = resolve_schema_paths(["some_pkg.SCHEMA_FILE"])
+
+    assert result == [schema_file]
+
+
+def test_resolve_schema_paths_accepts_file_with_any_extension(tmp_path, schema_str):
+    schema_file = tmp_path / "my_schema_file.any"
+    schema_file.write_text(schema_str, encoding="utf-8")
+
+    result = resolve_schema_paths([schema_file.as_posix()])
+
+    assert result == [schema_file]
+
+
+def test_resolve_schema_paths_accepts_local_dotted_names(
+    tmp_path, schema_str, extra_type_str, mocker
+):
+    # dotted file/directory names must be treated as local paths, not import paths
+    dotted_file = tmp_path / "my.schema.graphql"
+    dotted_file.write_text(schema_str, encoding="utf-8")
+    dotted_dir = tmp_path / "my.schemas.dir"
+    dotted_dir.mkdir()
+    (dotted_dir / "user.graphql").write_text(extra_type_str, encoding="utf-8")
+    mock_import = mocker.patch(
+        "ariadne_codegen.module_importer.importlib.import_module"
+    )
+
+    result = resolve_schema_paths([dotted_file.as_posix(), dotted_dir.as_posix()])
+
+    assert dotted_file in result
+    assert {"my.schema.graphql", "user.graphql"} == {p.name for p in result}
+    mock_import.assert_not_called()
+
+
+def test_resolve_schema_paths_raises_invalid_configuration_on_import_error(mocker):
+    mocker.patch(
+        "ariadne_codegen.module_importer.importlib.import_module",
+        side_effect=ModuleNotFoundError("module not found"),
+    )
+
+    with pytest.raises(InvalidConfiguration):
+        resolve_schema_paths(["nonexistent_pkg.attr"])
+
+
+def test_resolve_schema_paths_raises_invalid_configuration_on_missing_attribute(mocker):
+    mock_module = mocker.Mock(spec=[])
+    mocker.patch(
+        "ariadne_codegen.module_importer.importlib.import_module",
+        return_value=mock_module,
+    )
+
+    with pytest.raises(InvalidConfiguration):
+        resolve_schema_paths(["some_pkg.MISSING_ATTR"])
+
+
+def test_resolve_schema_paths_raises_when_callable_returns_missing_file(
+    tmp_path, mocker
+):
+    missing = tmp_path / "missing.graphql"  # never created
+    mock_module = mocker.Mock()
+    mock_module.get_files = mocker.Mock(return_value=[missing.as_posix()])
+    mocker.patch(
+        "ariadne_codegen.module_importer.importlib.import_module",
+        return_value=mock_module,
+    )
+
+    with pytest.raises(InvalidConfiguration):
+        resolve_schema_paths(["some_pkg.get_files"])
+
+
+def test_resolve_schema_paths_raises_when_variable_points_to_missing_file(
+    tmp_path, mocker
+):
+    missing = tmp_path / "missing.graphql"  # never created
+    mock_module = mocker.Mock()
+    mock_module.SCHEMA_FILE = missing.as_posix()
+    mocker.patch(
+        "ariadne_codegen.module_importer.importlib.import_module",
+        return_value=mock_module,
+    )
+
+    with pytest.raises(InvalidConfiguration):
+        resolve_schema_paths(["some_pkg.SCHEMA_FILE"])
+
+
+def test_resolve_schema_paths_raises_when_callable_returns_non_iterable(mocker):
+    mock_module = mocker.Mock()
+    mock_module.get_files = mocker.Mock(return_value=42)  # not a list of paths
+    mocker.patch(
+        "ariadne_codegen.module_importer.importlib.import_module",
+        return_value=mock_module,
+    )
+
+    with pytest.raises(InvalidConfiguration):
+        resolve_schema_paths(["some_pkg.get_files"])
+
+
+def test_resolve_schema_paths_raises_when_callable_returns_invalid_item(mocker):
+    mock_module = mocker.Mock()
+    mock_module.get_files = mocker.Mock(return_value=[None, 123])  # not paths
+    mocker.patch(
+        "ariadne_codegen.module_importer.importlib.import_module",
+        return_value=mock_module,
+    )
+
+    with pytest.raises(InvalidConfiguration):
+        resolve_schema_paths(["some_pkg.get_files"])
+
+
+def test_resolve_schema_paths_raises_when_variable_is_wrong_type(mocker):
+    mock_module = mocker.Mock()
+    mock_module.NOT_A_PATH = 123  # not callable, not str/Path
+    mocker.patch(
+        "ariadne_codegen.module_importer.importlib.import_module",
+        return_value=mock_module,
+    )
+
+    with pytest.raises(InvalidConfiguration):
+        resolve_schema_paths(["some_pkg.NOT_A_PATH"])
+
+
+def test_resolve_schema_paths_raises_invalid_configuration_for_source_without_dot(
+    tmp_path,
+):
+    missing = tmp_path / "does_not_exist"  # neither a file/dir nor a dotted path
+
+    with pytest.raises(InvalidConfiguration):
+        resolve_schema_paths([missing.name])
+
+
+def test_get_graphql_schema_from_paths_returns_graphql_schema(
+    tmp_path, schema_str, extra_type_str
+):
+    file1 = tmp_path / "schema.graphql"
+    file1.write_text(schema_str, encoding="utf-8")
+    file2 = tmp_path / "user.graphql"
+    file2.write_text(extra_type_str, encoding="utf-8")
+
+    result = get_graphql_schema_from_paths([file1.as_posix(), file2.as_posix()])
+
+    assert isinstance(result, GraphQLSchema)
+    assert "Custom" in result.type_map
+    assert "User" in result.type_map
+
+
+def test_get_graphql_schema_from_paths_with_directory_source(schemas_directory):
+    result = get_graphql_schema_from_paths([schemas_directory.as_posix()])
+
+    assert isinstance(result, GraphQLSchema)
+    assert "Custom" in result.type_map
+    assert "User" in result.type_map
+
+
+def test_get_graphql_schema_from_paths_merges_types_from_all_sources(
+    tmp_path, schema_str, extra_type_str
+):
+    dir1 = tmp_path / "base"
+    dir1.mkdir()
+    (dir1 / "schema.graphql").write_text(schema_str, encoding="utf-8")
+
+    dir2 = tmp_path / "extra"
+    dir2.mkdir()
+    (dir2 / "user.graphql").write_text(extra_type_str, encoding="utf-8")
+
+    result = get_graphql_schema_from_paths([dir1.as_posix(), dir2.as_posix()])
+
+    assert "Custom" in result.type_map
+    assert "User" in result.type_map
+
+
+def test_get_graphql_schema_from_paths_invalid_syntax_raises_invalid_graphql_syntax(
+    invalid_syntax_schema_file,
+):
+    with pytest.raises(InvalidGraphqlSyntax):
+        get_graphql_schema_from_paths([invalid_syntax_schema_file.as_posix()])

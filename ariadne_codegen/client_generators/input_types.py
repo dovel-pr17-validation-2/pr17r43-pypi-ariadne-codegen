@@ -1,0 +1,268 @@
+import ast
+from collections import defaultdict
+from copy import deepcopy
+from typing import Optional, cast
+from warnings import warn
+
+from graphql import (
+    GraphQLEnumType,
+    GraphQLInputObjectType,
+    GraphQLScalarType,
+    GraphQLSchema,
+)
+
+from ..codegen import (
+    generate_ann_assign,
+    generate_class_def,
+    generate_constant,
+    generate_import_from,
+    generate_keyword,
+    generate_model_rebuild_calls,
+    generate_module,
+    generate_name,
+    generate_pass,
+    generate_pydantic_field,
+)
+from ..plugins.manager import PluginManager
+from ..utils import needs_explicit_alias, process_name
+from .constants import (
+    ALIAS_KEYWORD,
+    ANNOTATED,
+    ANY,
+    BASE_MODEL_CLASS_NAME,
+    BASE_MODEL_IMPORT,
+    FIELD_CLASS,
+    OPTIONAL,
+    PLAIN_SERIALIZER,
+    PYDANTIC_MODULE,
+    TYPING_MODULE,
+    UNION,
+    UPLOAD_IMPORT,
+)
+from .input_fields import parse_input_field_default_value, parse_input_field_type
+from .scalars import ScalarData, generate_scalar_imports
+
+
+class InputTypesGenerator:
+    def __init__(
+        self,
+        schema: GraphQLSchema,
+        enums_module: str = "enums",
+        base_model_import: ast.ImportFrom = BASE_MODEL_IMPORT,
+        upload_import: Optional[ast.ImportFrom] = UPLOAD_IMPORT,
+        convert_to_snake_case: bool = True,
+        custom_scalars: Optional[dict[str, ScalarData]] = None,
+        plugin_manager: Optional[PluginManager] = None,
+        defer_model_build: bool = False,
+        use_alias_generator: bool = False,
+    ) -> None:
+        self.schema = schema
+        self.convert_to_snake_case = convert_to_snake_case
+        self.enums_module = enums_module
+        self.custom_scalars = custom_scalars if custom_scalars else {}
+        self.plugin_manager = plugin_manager
+        self.defer_model_build = defer_model_build
+        self.use_alias_generator = use_alias_generator
+        self.multipart_uploads = upload_import is not None
+
+        self._imports = [
+            generate_import_from([OPTIONAL, ANY, UNION, ANNOTATED], TYPING_MODULE),
+            generate_import_from([FIELD_CLASS, PLAIN_SERIALIZER], PYDANTIC_MODULE),
+            deepcopy(base_model_import),
+            *([] if upload_import is None else [deepcopy(upload_import)]),
+        ]
+        self._dependencies: dict[str, list[str]] = defaultdict(list)
+        self._used_enums: dict[str, list[str]] = defaultdict(list)
+        self._used_scalars: list[str] = []
+        self._class_defs: list[ast.ClassDef] = []
+        self._input_definitions: dict[str, GraphQLInputObjectType] = {}
+        for definition in self._filter_input_types():
+            class_def = self._parse_input_definition(definition)
+            self._class_defs.append(class_def)
+            self._input_definitions[class_def.name] = definition
+        self._generated_public_names: list[str] = []
+
+    def generate(self, types_to_include: Optional[list[str]] = None) -> ast.Module:
+        class_defs = self._filter_class_defs(types_to_include=types_to_include)
+        self._warn_about_deprecated_fields(class_defs)
+        self._generated_public_names = [class_def.name for class_def in class_defs]
+
+        if used_imports := self.get_used_enums():
+            self._imports.append(
+                generate_import_from(used_imports, self.enums_module, 1)
+            )
+
+        for scalar_name in self._used_scalars:
+            scalar_data = self.custom_scalars[scalar_name]
+            self._imports.extend(generate_scalar_imports(scalar_data))
+
+        model_rebuild_calls = generate_model_rebuild_calls(
+            class_defs, self.defer_model_build
+        )
+
+        module_body = (
+            cast(list[ast.stmt], self._imports)
+            + cast(list[ast.stmt], class_defs)
+            + cast(list[ast.stmt], model_rebuild_calls)
+        )
+        module = generate_module(body=module_body)
+
+        if self.plugin_manager:
+            module = self.plugin_manager.generate_inputs_module(module)
+        return module
+
+    def get_generated_public_names(self) -> list[str]:
+        return self._generated_public_names
+
+    def get_used_enums(self) -> list[str]:
+        enums = []
+        for input_name in self._generated_public_names:
+            enums.extend(self._used_enums[input_name])
+        return enums
+
+    def _warn_about_deprecated_fields(self, class_defs: list[ast.ClassDef]) -> None:
+        """Warn only about inputs included in the generated module.
+
+        A schema usually defines more inputs than the generated package uses.
+        """
+        for class_def in class_defs:
+            definition = self._input_definitions.get(class_def.name)
+            if not definition:
+                continue
+
+            for field_name, field in definition.fields.items():
+                if field.deprecation_reason:
+                    # stacklevel=2 keeps the warning attributed to this module.
+                    warn(
+                        f"Input field '{field_name}' on input "
+                        f"'{definition.name}' is deprecated: "
+                        f"{field.deprecation_reason}",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+
+    def _filter_input_types(self) -> list[GraphQLInputObjectType]:
+        return [
+            definition
+            for name, definition in self.schema.type_map.items()
+            if isinstance(definition, GraphQLInputObjectType)
+            and not name.startswith("__")
+        ]
+
+    def _filter_class_defs(
+        self, types_to_include: Optional[list[str]] = None
+    ) -> list[ast.ClassDef]:
+        if types_to_include is None:
+            return self._class_defs
+
+        types_names = set()
+        for name in types_to_include:
+            types_names.update(self._get_dependencies_of_type(name))
+
+        return [
+            class_def for class_def in self._class_defs if class_def.name in types_names
+        ]
+
+    def _get_dependencies_of_type(self, type_name: str) -> list[str]:
+        visited = set()
+        result = []
+
+        def dfs(node):
+            if node not in visited:
+                visited.add(node)
+                result.append(node)
+
+                for neighbor in self._dependencies[node]:
+                    dfs(neighbor)
+
+        dfs(type_name)
+        return result
+
+    def _parse_input_definition(
+        self, definition: GraphQLInputObjectType
+    ) -> ast.ClassDef:
+        class_def = generate_class_def(
+            name=definition.name,
+            base_names=[BASE_MODEL_CLASS_NAME],
+            description=definition.description or "",
+        )
+        lineno = 0
+        for org_name, field in definition.fields.items():
+            lineno += 1
+            name = process_name(
+                org_name,
+                convert_to_snake_case=self.convert_to_snake_case,
+                plugin_manager=self.plugin_manager,
+                node=field,
+                trim_leading_underscore=True,
+                handle_pydantic_resrved_field_names=True,
+            )
+            annotation, field_type = parse_input_field_type(
+                field.type,
+                custom_scalars=self.custom_scalars,
+                multipart_uploads=self.multipart_uploads,
+            )
+            field_implementation = generate_ann_assign(
+                target=generate_name(name),
+                annotation=annotation,
+                value=parse_input_field_default_value(
+                    node=field.ast_node, annotation=annotation, field_type=field_type
+                ),
+                lineno=lineno,
+            )
+            if needs_explicit_alias(name, org_name, self.use_alias_generator):
+                field_implementation.value = self._process_field_value(
+                    field_implementation=field_implementation, alias=org_name
+                )
+
+            if self.plugin_manager:
+                field_implementation = self.plugin_manager.generate_input_field(
+                    field_implementation, input_field=field, field_name=org_name
+                )
+            class_def.body.append(field_implementation)
+            if field.description:
+                lineno += 1
+                docstring = ast.Expr(value=ast.Constant(value=field.description))
+                class_def.body.append(docstring)
+            self._save_dependencies(root_type=definition.name, field_type=field_type)
+
+        if not class_def.body:
+            class_def.body.append(generate_pass())
+
+        if self.plugin_manager:
+            class_def = self.plugin_manager.generate_input_class(
+                class_def, input_type=definition
+            )
+
+        return class_def
+
+    def _process_field_value(
+        self,
+        field_implementation: ast.AnnAssign,
+        alias: str,
+    ) -> ast.Call:
+        field_with_alias = generate_pydantic_field(
+            {ALIAS_KEYWORD: generate_constant(alias)}
+        )
+        if field_implementation.value:
+            if (
+                isinstance(field_implementation.value, ast.Call)
+                and isinstance(field_implementation.value.func, ast.Name)
+                and field_implementation.value.func.id == FIELD_CLASS
+            ):
+                field_with_alias.keywords.extend(field_implementation.value.keywords)
+            else:
+                field_with_alias.keywords.append(
+                    generate_keyword(value=field_implementation.value, arg="default")
+                )
+        return field_with_alias
+
+    def _save_dependencies(self, root_type: str, field_type: str = "") -> None:
+        if not field_type:
+            return
+        if isinstance(self.schema.type_map[field_type], GraphQLInputObjectType):
+            self._dependencies[root_type].append(field_type)
+        elif isinstance(self.schema.type_map[field_type], GraphQLEnumType):
+            self._used_enums[root_type].append(field_type)
+        elif isinstance(self.schema.type_map[field_type], GraphQLScalarType):
+            self._used_scalars.append(field_type)

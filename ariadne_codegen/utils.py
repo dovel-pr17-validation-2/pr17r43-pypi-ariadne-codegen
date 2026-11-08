@@ -1,0 +1,446 @@
+import ast
+import builtins
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from functools import lru_cache
+from keyword import iskeyword
+from pathlib import Path
+from textwrap import indent
+from typing import Optional
+
+from graphql import Node
+from pydantic import BaseModel
+from pydantic.alias_generators import to_camel
+
+from .plugins.manager import PluginManager
+
+_LINE_LENGTH = 88
+_TARGET_VERSION = "py310"
+_SUBPROCESS_TIMEOUT = 30
+
+# `ruff check --fix` exits 1 when violations it cannot fix remain. That is not an
+# error for us: the fixable ones were still applied.
+_RUFF_CHECK_OK_RETURN_CODES = (0, 1)
+
+PYDANTIC_ALIAS_GENERATORS_MODULE = "pydantic.alias_generators"
+TO_CAMEL_NAME = "to_camel"
+
+# `to_camel` is version-stable only for lowercase/digit/underscore names; names
+# with an uppercase letter were mangled by `str.title()` before pydantic 2.8. The
+# generator omits aliases using its pydantic while the package rebuilds them with
+# the user's, so only these names are safe to leave to `to_camel`.
+_VERSION_STABLE_UNDER_TO_CAMEL = re.compile(r"[a-z0-9_]*")
+
+
+def needs_explicit_alias(
+    python_name: str, schema_name: str, use_alias_generator: bool
+) -> bool:
+    """Whether a field must carry an explicit `Field(alias=...)`.
+
+    With `alias_generator=to_camel` on the base model, pydantic derives the alias
+    from the Python name, so only the names it cannot reconstruct need spelling
+    out: `__typename`, keyword-escaped names like `list_`, acronyms (`productID`)
+    and schemas that are already snake_case (`some_field` -> `someField`).
+    """
+    if not use_alias_generator:
+        return python_name != schema_name
+    if not _VERSION_STABLE_UNDER_TO_CAMEL.fullmatch(python_name):
+        return True
+    return to_camel(python_name) != schema_name
+
+
+@lru_cache(maxsize=1)
+def _ruff_command() -> list[str]:
+    """Command prefix used to invoke ruff.
+
+    Running the binary directly skips a full Python interpreter startup on every
+    call, which otherwise dominates generation time for packages with many
+    modules. Falls back to `python -m ruff` if the binary cannot be located.
+    """
+    try:
+        from ruff.__main__ import find_ruff_bin
+
+        return [find_ruff_bin()]
+    except (ImportError, FileNotFoundError):
+        pass
+
+    ruff_path = shutil.which("ruff")
+    if ruff_path:
+        return [ruff_path]
+
+    return [sys.executable, "-m", "ruff"]
+
+
+def _ruff_style_args() -> list[str]:
+    """`--isolated` keeps output deterministic regardless of the user's config."""
+    return [
+        "--isolated",
+        "--target-version",
+        _TARGET_VERSION,
+        "--line-length",
+        str(_LINE_LENGTH),
+    ]
+
+
+def _ruff_select(remove_unused_imports: bool) -> str:
+    return "I,F401" if remove_unused_imports else "I"
+
+
+def format_code(code: str, *, remove_unused_imports: bool = True) -> str:
+    """Format a single module with ruff: sort imports, drop unused ones, format."""
+    check = subprocess.run(
+        _ruff_command()
+        + ["check", "--fix"]
+        + _ruff_style_args()
+        + [
+            "--select",
+            _ruff_select(remove_unused_imports),
+            "--stdin-filename",
+            "generated.py",
+            "-",
+        ],
+        input=code,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    if check.returncode not in _RUFF_CHECK_OK_RETURN_CODES:
+        raise RuntimeError(
+            f"ruff check failed (exit code {check.returncode}): {check.stderr}"
+        )
+    # An empty result is legitimate (e.g. a module of only unused imports), so
+    # this must not fall back to `code` on a falsy stdout.
+    code = check.stdout
+
+    result = subprocess.run(
+        _ruff_command() + ["format"] + _ruff_style_args() + ["-"],
+        input=code,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ruff format failed (exit code {result.returncode}): {result.stderr}"
+        )
+    return result.stdout
+
+
+def format_many(codes: list[str], *, remove_unused_imports: bool = True) -> list[str]:
+    """Format many modules with a single pair of ruff invocations.
+
+    Equivalent to calling `format_code` on each module, but ruff walks a scratch
+    directory instead of being spawned twice per module.
+    """
+    if not codes:
+        return []
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        paths = []
+        for index, code in enumerate(codes):
+            path = Path(tmp_dir) / f"module_{index}.py"
+            path.write_text(code, encoding="utf-8")
+            paths.append(path)
+
+        check = subprocess.run(
+            _ruff_command()
+            + ["check", "--fix", "--no-cache"]
+            + _ruff_style_args()
+            + ["--select", _ruff_select(remove_unused_imports), tmp_dir],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=_SUBPROCESS_TIMEOUT,
+        )
+        if check.returncode not in _RUFF_CHECK_OK_RETURN_CODES:
+            raise RuntimeError(
+                f"ruff check failed (exit code {check.returncode}): {check.stderr}"
+            )
+
+        result = subprocess.run(
+            _ruff_command() + ["format", "--no-cache"] + _ruff_style_args() + [tmp_dir],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=_SUBPROCESS_TIMEOUT,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ruff format failed (exit code {result.returncode}): {result.stderr}"
+            )
+
+        return [path.read_text(encoding="utf-8") for path in paths]
+
+
+PYDANTIC_RESERVED_FIELD_NAMES = [
+    name for name in dir(BaseModel) if not name.startswith("_")
+]
+
+
+def _is_builtin_type_name(name: str) -> bool:
+    try:
+        value = getattr(builtins, name)
+    except AttributeError:
+        return False
+    return isinstance(value, type)
+
+
+def ast_to_raw_str(
+    ast_obj: ast.AST,
+    multiline_strings: bool = False,
+    multiline_strings_offset: int = 4,
+) -> str:
+    """Convert ast object into string, without running ruff over it."""
+    code = ast.unparse(ast_obj)
+    code = remove_blank_line_between_class_and_content(code)
+    if multiline_strings:
+        code = format_multiline_strings(code, offset=multiline_strings_offset)
+    return code
+
+
+def ast_to_str(
+    ast_obj: ast.AST,
+    remove_unused_imports: bool = True,
+    multiline_strings: bool = False,
+    multiline_strings_offset: int = 4,
+) -> str:
+    """Convert ast object into string."""
+    return format_code(
+        ast_to_raw_str(ast_obj, multiline_strings, multiline_strings_offset),
+        remove_unused_imports=remove_unused_imports,
+    )
+
+
+def remove_blank_line_between_class_and_content(code: str) -> str:
+    """Removes blank lines between class and first method.
+
+    We are doing this for code style consistency and backwards compatibility.
+    """
+    code_lines: list[str] = []
+    skip_blank_lines = False
+    for line in code.splitlines():
+        if skip_blank_lines and line:
+            skip_blank_lines = False
+        elif line.startswith("class "):
+            skip_blank_lines = True
+        if not skip_blank_lines or line:
+            code_lines.append(line)
+    return "\n".join(code_lines)
+
+
+def str_to_snake_case(name: str) -> str:
+    """Converts camelCase or PascalCase string into snake_case."""
+    # lower-case letters that optionally start with a single upper-case letter
+    lowercase_words = r"[A-Z]?[a-z]+"
+    # upper-case letters, excluding last letter if it is followed by a lower-case letter
+    uppercase_words = r"[A-Z]+(?=[A-Z][a-z]|\d|\W|_|$)"
+    numbers = r"\d+"
+
+    words = re.findall(rf"{lowercase_words}|{uppercase_words}|{numbers}", name)
+    return "_".join(map(str.lower, words))
+
+
+def str_to_pascal_case(name: str) -> str:
+    """Converts snake_case string into PascalCase."""
+    return "".join(n[:1].upper() + n[1:] for n in name.split("_"))
+
+
+def convert_to_multiline_string(
+    value: str, variable_indent_size: int = 8, offset: int = 4
+) -> str:
+    """
+    Renders a string value as an indented triple-quoted block.
+    eg. 'abc\\ndef\\nghi\\n' is rendered as
+    \"\"\"
+        abc
+        def
+        ghi
+        \"\"\"
+    """
+    body = value if value.endswith("\n") else value + "\n"
+    return '"""\n' + indent(body + '"""', (variable_indent_size + offset) * " ")
+
+
+def get_variable_indent_size(source: str) -> int:
+    "Returns number of white characters at the beginning of source."
+    match = re.match(r"\s*", source)
+    if match:
+        return len(match.group())
+    return 0
+
+
+# A run of 2+ adjacent string literals (implicit concatenation) as emitted by
+# ``ast.unparse``: single- or double-quoted, standard escapes, no raw newlines.
+_STRING_LITERAL = r"(?:'(?:\\.|[^'\\\n])*'|\"(?:\\.|[^\"\\\n])*\")"
+_CONCATENATED_STRINGS = re.compile(rf"{_STRING_LITERAL}(?:[^\S\n]*{_STRING_LITERAL})+")
+
+
+def format_multiline_strings(source: str, offset: int = 4) -> str:
+    """Renders implicitly-concatenated string literals as ``\"\"\"`` blocks."""
+
+    def _replace(match: "re.Match[str]") -> str:
+        run = match.group()
+        try:
+            value = ast.literal_eval(run)
+        except (ValueError, SyntaxError):
+            return run
+        if not isinstance(value, str) or "\n" not in value:
+            return run
+        # An embedded ``"""`` would close the block early; a backslash or ``\r``
+        # would change the string. Keep those escaped and concatenated instead.
+        if any(c in value for c in ('"""', "\\", "\r")):
+            return run
+        line = source[source.rfind("\n", 0, match.start()) + 1 :]
+        return convert_to_multiline_string(
+            value, get_variable_indent_size(line), offset
+        )
+
+    return _CONCATENATED_STRINGS.sub(_replace, source)
+
+
+def process_name(
+    name: str,
+    convert_to_snake_case: bool,
+    plugin_manager: Optional[PluginManager] = None,
+    node: Optional[Node] = None,
+    trim_leading_underscore: bool = False,
+    handle_pydantic_resrved_field_names: bool = False,
+) -> str:
+    """Processes the GraphQL name to remove keywords
+    and optionally convert to snake_case."""
+    processed_name = name
+    if convert_to_snake_case:
+        processed_name = str_to_snake_case(processed_name)
+    if iskeyword(processed_name) or _is_builtin_type_name(processed_name):
+        processed_name += "_"
+    if (
+        handle_pydantic_resrved_field_names
+        and processed_name in PYDANTIC_RESERVED_FIELD_NAMES
+    ):
+        processed_name += "_"
+    if trim_leading_underscore:
+        processed_name = processed_name.lstrip("_")
+    if plugin_manager:
+        processed_name = plugin_manager.process_name(processed_name, node=node)
+    if set(name) == {"_"} and not processed_name:
+        return "underscore_named_field_"
+    return processed_name
+
+
+def _split_leading_comments(code: str) -> tuple[str, str]:
+    """Separate a module's leading comment block from its code.
+
+    `ast.unparse` drops comments, which would otherwise discard the header that
+    `_add_comments_to_code` puts on every generated file.
+    """
+    lines = code.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return "".join(lines[:index]), "".join(lines[index:])
+    return "", code
+
+
+def _set_base_model_config_kwargs(code: str, kwargs: dict[str, ast.expr]) -> str:
+    """Set keyword arguments on the ``ConfigDict`` call in ``BaseModel``.
+
+    Keywords already present are left alone (user values win); all are applied in
+    one parse/unparse round trip. Raises when there is no such call to patch: the
+    generators have already emitted code that assumes the config landed, so
+    silently skipping it would ship a package that misbehaves at runtime.
+    """
+    header, code = _split_leading_comments(code)
+    tree = ast.parse(code)
+    patched = False
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        if node.name != "BaseModel":
+            continue
+        for statement in node.body:
+            if not isinstance(statement, ast.Assign):
+                continue
+            call = statement.value
+            if not isinstance(call, ast.Call):
+                continue
+            if not isinstance(call.func, ast.Name):
+                continue
+            if call.func.id != "ConfigDict":
+                continue
+            patched = True
+            present = {kw.arg for kw in call.keywords}
+            call.keywords.extend(
+                ast.keyword(arg=arg, value=value)
+                for arg, value in kwargs.items()
+                if arg not in present
+            )
+    if not patched:
+        raise RuntimeError(
+            f"Cannot apply {', '.join(sorted(kwargs))} to the generated `BaseModel`: "
+            "no `model_config = ConfigDict(...)` assignment found in the base model "
+            "file. The generated package would not carry the settings it was "
+            "generated for."
+        )
+    ast.fix_missing_locations(tree)
+    return header + ast.unparse(tree)
+
+
+def _imports_name(code: str, module: str, name: str) -> bool:
+    """Whether ``code`` already binds ``name`` via ``from module import name``."""
+    return any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == module
+        and any(alias.name == name and alias.asname is None for alias in node.names)
+        for node in ast.parse(code).body
+    )
+
+
+def _add_import_to_base_model(code: str, module: str, name: str) -> str:
+    header, body = _split_leading_comments(code)
+    if _imports_name(body, module, name):
+        return code
+    return f"{header}from {module} import {name}\n{body}"
+
+
+def rewrite_base_model(
+    code: str,
+    *,
+    forbid_extra: bool = False,
+    defer_build: bool = False,
+    alias_generator: bool = False,
+) -> str:
+    """Apply the requested ConfigDict settings to the copied `base_model.py`.
+
+    Returns `code` untouched when nothing is requested. Otherwise `ast.unparse`
+    drops the copy's blank lines and import order, so the result goes back to ruff.
+
+    `alias_generator` must stay in sync with the generators: they emit
+    `Field(alias=...)` only where `to_camel` cannot reconstruct the GraphQL name,
+    so a package generated with it but missing the config would drop every field
+    whose alias was left implicit.
+    """
+    kwargs: dict[str, ast.expr] = {}
+    if forbid_extra:
+        kwargs["extra"] = ast.Constant("forbid")
+    if defer_build:
+        kwargs["defer_build"] = ast.Constant(True)
+    if alias_generator:
+        kwargs["alias_generator"] = ast.Name(id=TO_CAMEL_NAME)
+    if not kwargs:
+        return code
+
+    rewritten = _set_base_model_config_kwargs(code, kwargs)
+    if alias_generator:
+        rewritten = _add_import_to_base_model(
+            rewritten, PYDANTIC_ALIAS_GENERATORS_MODULE, TO_CAMEL_NAME
+        )
+    return format_code(rewritten, remove_unused_imports=False)

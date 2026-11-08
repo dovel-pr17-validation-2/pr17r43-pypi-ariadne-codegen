@@ -1,0 +1,17 @@
+query GetUser($id: ID!) {
+  user(id: $id) {
+    id
+    name
+  }
+}
+
+mutation CreateUser($input: CreateUserInput!) {
+  createUser(input: $input) {
+    id
+    name
+  }
+}
+
+mutation UploadAvatar($file: Upload!) {
+  uploadAvatar(file: $file)
+}

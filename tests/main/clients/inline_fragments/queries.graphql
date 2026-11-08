@@ -1,0 +1,172 @@
+query InterfaceA {
+  queryI {
+    id
+    ... on TypeA {
+      fieldA
+    }
+    ... on TypeB {
+      fieldB
+    }
+  }
+}
+
+query InterfaceB {
+  queryI {
+    id
+    ... on TypeA {
+      fieldA
+    }
+  }
+}
+
+query InterfaceC {
+  queryI {
+    id
+  }
+}
+
+query ListInterface {
+  queryListI {
+    id
+    ... on TypeA {
+      fieldA
+    }
+    ... on TypeB {
+      fieldB
+    }
+  }
+}
+
+query InterfaceWithTypename {
+  queryI {
+    __typename
+    id
+  }
+}
+
+query UnionA {
+  queryU {
+    ... on TypeA {
+      id
+      fieldA
+    }
+    ... on TypeB {
+      id
+      fieldB
+    }
+  }
+}
+
+query UnionB {
+  queryU {
+    ... on TypeA {
+      id
+      fieldA
+    }
+  }
+}
+
+query ListUnion {
+  queryListU {
+    ... on TypeA {
+      id
+      fieldA
+    }
+    ... on TypeB {
+      id
+      fieldB
+    }
+  }
+}
+
+query queryWithFragmentOnInterface {
+  queryI {
+    ...fragmentOnInterface
+  }
+}
+
+fragment fragmentOnInterface on Interface {
+  id
+  ... on TypeA {
+    fieldA
+  }
+  ... on TypeB {
+    fieldB
+  }
+}
+
+query queryWithFragmentOnUnion {
+  queryU {
+    ...fragmentOnUnion
+  }
+}
+
+fragment fragmentOnUnion on Union {
+  ... on TypeA {
+    id
+    fieldA
+  }
+  ... on TypeB {
+    id
+    fieldB
+  }
+}
+
+query queryWithFragmentOnQueryWithInterface {
+  ...FragmentOnQueryWithInterface
+}
+
+fragment FragmentOnQueryWithInterface on Query {
+  queryI {
+    id
+    ... on TypeA {
+      fieldA
+    }
+    ... on TypeB {
+      fieldB
+    }
+  }
+}
+
+query queryWithFragmentOnQueryWithUnion {
+  ...FragmentOnQueryWithUnion
+}
+
+fragment FragmentOnQueryWithUnion on Query {
+  queryU {
+    ... on TypeA {
+      id
+      fieldA
+    }
+    ... on TypeB {
+      id
+      fieldB
+    }
+  }
+}
+
+fragment unusedFragmentOnInterface on Interface {
+  id
+  ... on TypeA {
+    fieldA
+  }
+  ... on TypeB {
+    fieldB
+  }
+}
+
+fragment unusedFragmentOnUnion on Union {
+  ... on TypeA {
+    id
+    fieldA
+  }
+  ... on TypeB {
+    id
+    fieldB
+  }
+}
+
+fragment unusedFragmentOnTypeA on TypeA {
+  id
+  fieldA
+}

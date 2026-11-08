@@ -1,0 +1,12 @@
+[tool.ariadne-codegen]
+schema_path = "schema.graphql"
+queries_path = "queries.graphql"
+include_comments = "none"
+target_package_name = "custom_names_client"
+
+client_file_name = "custom_client"
+enums_module_name = "custom_enums"
+input_types_module_name = "custom_input_types"
+
+[tool.ariadne-codegen.scalars.TestScalar]
+type = "str"

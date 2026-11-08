@@ -1,0 +1,3 @@
+from .fragments import FragmentOnQueryWithInterface
+
+QueryWithFragmentOnQueryWithInterface = FragmentOnQueryWithInterface

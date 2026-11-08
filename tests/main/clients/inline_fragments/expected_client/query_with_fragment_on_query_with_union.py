@@ -1,0 +1,3 @@
+from .fragments import FragmentOnQueryWithUnion
+
+QueryWithFragmentOnQueryWithUnion = FragmentOnQueryWithUnion

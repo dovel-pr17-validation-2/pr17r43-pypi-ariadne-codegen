@@ -1,0 +1,252 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ariadne-codegen"
+description = "Generate fully typed GraphQL client from schema, queries and mutations!"
+authors = [{ name = "Mirumee Software", email = "ariadne@mirumee.com" }]
+dynamic = ["version"]
+requires-python = ">= 3.10"
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: BSD License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+  "click~=8.3",
+  "graphql-core>=3.2.7,<3.3",
+  "toml~=0.10",
+  "httpx~=0.28",
+  # use_alias_generator relies on pydantic.alias_generators.to_camel, whose
+  # case handling was fixed in 2.8 (https://github.com/pydantic/pydantic/pull/9561)
+  "pydantic>=2.8.0,<3.0.0",
+  "ruff>=0.15.0",
+]
+
+[project.optional-dependencies]
+dev = ["ipdb"]
+test = [
+  "ariadne",
+  "freezegun",
+  "pytest",
+  "pytest-asyncio",
+  "pytest-httpx",
+  "pytest-mock",
+  "requests-toolbelt",
+  "types-toml",
+  "websockets>=14.2",
+  "opentelemetry-api",
+]
+# exact pin: ty adds diagnostics in patch releases, which turns CI red on its own
+types = ["ty==0.0.88"]
+subscriptions = ["websockets>=15"]
+opentelemetry = ["opentelemetry-api"]
+
+[project.scripts]
+ariadne-codegen = "ariadne_codegen.main:main"
+
+[project.urls]
+"Homepage" = "https://ariadnegraphql.org/"
+"Repository" = "https://github.com/mirumee/ariadne-codegen"
+"Bug Tracker" = "https://github.com/mirumee/ariadne-codegen/issues"
+"Community" = "https://github.com/mirumee/ariadne/discussions"
+"Twitter" = "https://twitter.com/AriadneGraphQL"
+
+# Hatch configuration
+
+[tool.hatch.build]
+include = ["ariadne_codegen/**/*.py", "ariadne_codegen/py.typed"]
+exclude = ["tests"]
+
+[tool.hatch.version]
+path = "ariadne_codegen/__about__.py"
+
+[tool.hatch.envs.default]
+python = "3.10"
+features = ["dev", "types", "test", "subscriptions", "opentelemetry"]
+path = ".venv"
+
+[tool.hatch.envs.default.scripts]
+lint = ["hatch check code", "hatch check fmt", "hatch run types:check"]
+check = [
+  "hatch check code --fix",
+  "hatch check fmt --fix",
+  "hatch test -a -p",
+  "hatch test --cover",
+  "hatch run types:check",
+]
+changelog-preview = "git cliff --unreleased --strip all"
+changelog-update = "git cliff --unreleased -o CHANGELOG.md"
+release-notes = "git cliff --latest --strip all"
+
+## Types environment
+
+[tool.hatch.envs.types.scripts]
+check = ["ty check"]
+
+## Static analysis environments
+#
+# `config-path` stops hatch from injecting its own bundled ruff defaults, so the
+# `[tool.ruff]` config below is used verbatim, at the ruff version pinned here.
+# `hatch-static-analysis` backs the deprecated `hatch fmt`; it is pinned as well
+# so that running it does not reformat the tree with a different ruff version.
+
+[tool.hatch.envs.hatch-check-code]
+config-path = "none"
+dependencies = ["ruff>=0.15.0,<0.16.0"]
+
+[tool.hatch.envs.hatch-check-fmt]
+config-path = "none"
+dependencies = ["ruff>=0.15.0,<0.16.0"]
+
+[tool.hatch.envs.hatch-static-analysis]
+config-path = "none"
+dependencies = ["ruff>=0.15.0,<0.16.0"]
+
+## Type checking environment
+#
+# `hatch check types` runs pyrefly by default. Point it at ty instead, so that it
+# and `hatch run types:check` agree and `# ty: ignore[...]` stays the only
+# suppression syntax. `config-path` stops hatch writing a pyrefly.toml we ignore.
+
+[tool.hatch.envs.hatch-check-types]
+python = "3.10"
+config-path = "none"
+features = ["types", "test", "subscriptions", "opentelemetry"]
+dependencies = []
+
+[tool.hatch.envs.hatch-check-types.scripts]
+check = "ty check {args}"
+# ty has no summary-statistics or type-coverage report, so `--summarize` adds
+# nothing and `--cover` fails loudly rather than as `coverage: command not found`.
+check-summarize = "ty check {args}"
+coverage = "python -c \"raise SystemExit('ty has no type-coverage report, so --cover is unsupported')\""
+
+## Test environments
+
+[tool.hatch.envs.hatch-test]
+features = ["test"]
+extra-args = []
+
+[[tool.hatch.envs.hatch-test.matrix]]
+python = ["3.10", "3.11", "3.12", "3.13", "3.14"]
+
+## Type checker (ty) configuration
+
+[tool.ty.environment]
+python-version = "3.10"
+
+[tool.ty.src]
+include = ["ariadne_codegen", "tests"]
+
+[tool.ty.rules]
+# Dependency files contain # type: ignore comments for mypy/pyright compat
+unused-type-ignore-comment = "ignore"
+# dependency files keep # ty: ignore comments that older ty releases need
+unused-ignore-comment = "ignore"
+# Some casts improve readability even when technically redundant for ty
+redundant-cast = "ignore"
+
+# Relax checks in test files (AST stubs are stricter than runtime behaviour;
+# union narrowing and stub limitations produce many false positives in tests)
+[[tool.ty.overrides]]
+include = ["tests/**"]
+[tool.ty.overrides.rules]
+missing-argument = "ignore"
+no-matching-overload = "ignore"
+unresolved-attribute = "ignore"
+invalid-argument-type = "ignore"
+unknown-argument = "ignore"
+not-iterable = "ignore"
+possibly-missing-attribute = "ignore"
+
+# Relax checks in generated expected output (not first-party packages)
+[[tool.ty.overrides]]
+include = [
+  "tests/main/clients/*/expected_client/**",
+  "tests/main/graphql_schemas/*/expected_schema.py",
+]
+[tool.ty.overrides.analysis]
+allowed-unresolved-imports = ["**"]
+[tool.ty.overrides.rules]
+# generated models narrow typename__ to a Literal when subclassing a fragment
+invalid-mutable-override = "ignore"
+
+## Coverage configuration
+
+[tool.coverage.run]
+source = ["ariadne_codegen", "tests"]
+
+[tool.coverage.report]
+exclude_also = [
+  "def __repr__",
+  "if self.debug:",
+  "if settings.DEBUG",
+  "raise AssertionError",
+  "raise NotImplementedError",
+  "if 0:",
+  "if __name__ == .__main__.:",
+  "if TYPE_CHECKING:",
+  "class .*\\bProtocol\\):",
+  "@(abc\\.)?abstractmethod",
+]
+omit = ["*/__about__.py", "*/__main__.py", "*/cli/__init__.py"]
+fail_under = 90
+
+## Ruff configuration
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.format]
+docstring-code-format = true
+docstring-code-line-length = 99
+exclude = ["tests/main/clients/*/expected_client/*"]
+
+[tool.ruff.lint]
+select = ["E", "F", "G", "I", "N", "Q", "UP", "B", "C90", "SIM", "T20", "TID"]
+ignore = ["TID252", "UP006", "UP007", "UP045"]
+task-tags = ["NOTE", "TODO", "FIXME", "HACK", "XXX"]
+
+[tool.ruff.lint.per-file-ignores]
+# Some rules are ignored in auto-generated files.
+"tests/main/graphql_schemas/*/expected_schema.py" = ["E501"]
+"tests/main/clients/*/expected_client/*" = ["E501", "N801", "F401"]
+
+[tool.ruff.lint.pycodestyle]
+ignore-overlong-task-comments = true
+
+[tool.ruff.lint.mccabe]
+max-complexity = 11
+
+[tool.ruff.lint.isort]
+known-first-party = ["ariadne_codegen"]
+
+[tool.ruff.lint.flake8-pytest-style]
+fixture-parentheses = false
+mark-parentheses = false
+
+# Pytest configuration
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Timing guards compare wall-clock ratios, so they are too noisy for a shared CI
+# runner. A `-m` on the command line replaces this one: `hatch test -- -m performance`.
+addopts = "-m 'not performance'"
+markers = [
+  "performance: timing guards for generated code (may be slow; run with -m performance)",
+]
