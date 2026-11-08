@@ -26,7 +26,7 @@ classifiers = [
 ]
 
 dependencies = [
-  "click~=8.3",
+  "click~=8.5",
   "graphql-core>=3.2.7,<3.3",
   "toml~=0.10",
   "httpx~=0.28",
